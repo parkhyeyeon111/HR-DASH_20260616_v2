@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* 안전 진단 오버레이: 오류를 기록만 하고, 로드 후 일정 시간 지나도 화면이 비어 있을 때만 안내 표시 (정상 렌더를 절대 방해하지 않음) */
 (function(){
@@ -177,6 +178,7 @@ const {
   useRef
 } = React;
 const API_URL = "https://script.google.com/macros/s/AKfycbzd8dkOgHBHcsauhB4H2ASU_mdJ9aSAS0IZi66kmwHaXy1QJq3sftoRyPjjxaqZamGjLw/exec";
+// [DEPRECATED] 공유 저장소는 Supabase 로 이전됨(아래 SheetDB 내부 SUPABASE_URL/KEY 사용). 이 상수는 더 이상 쓰이지 않음.
 const SHARED_API_URL = "https://script.google.com/macros/s/AKfycbzzX-VzggyDhiApcsQOpCOpclsdZfchHess10ZAAFKEauYEvlrp5XCgixwGzEi__Fv6/exec";
 const LS_KEY = "hr_v15";
 const GTMPL_KEY = "hr_v15_gtmpl";
@@ -298,70 +300,75 @@ const SheetDB = function () {
       });
     }
   }
+  /* ===== Supabase 연동 (Google Apps Script/시트 완전 대체) =====
+   * 아래 두 값을 본인 Supabase 프로젝트 값으로 교체하세요:
+   *   SUPABASE_URL      : Supabase 대시보드 → Project Settings → API → Project URL
+   *   SUPABASE_ANON_KEY : 같은 화면의 anon public key
+   * 테이블/권한(RLS) 설정 SQL 은 안내 메시지를 참고하세요. */
+  const SUPABASE_URL = "https://zaoccfqckkiglwmhfnsq.supabase.co";
+  const SUPABASE_ANON_KEY = "sb_publishable_mSZj02MZkJjoPD1b0TOjzQ_Ya58dndO";
+  const SUPA_TABLE = "hr_store";
+  const SUPA = (typeof window !== "undefined" && window.supabase && SUPABASE_URL.indexOf("YOUR_") < 0)
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+  const remoteListeners = new Set();
+  // 행 목록 → {team,...,cl:{},ins:{}} 상태 객체로 조립
+  function rowsToState(rows) {
+    const st = { cl: {}, ins: {} };
+    (rows || []).forEach(r => {
+      const c = r.collection, v = r.value;
+      if (c.indexOf("cl:") === 0) st.cl[c.slice(3)] = v;
+      else if (c.indexOf("ins:") === 0) st.ins[c.slice(4)] = v;
+      else st[c] = v;
+    });
+    return st;
+  }
+  async function fetchAll() {
+    if (!SUPA) throw new Error("Supabase 미설정");
+    const { data, error } = await SUPA.from(SUPA_TABLE).select("collection,value");
+    if (error) throw error;
+    return rowsToState(data);
+  }
+  async function upsert(collection, value) {
+    if (!SUPA) return false;
+    if (value === null || value === undefined) {
+      const { error } = await SUPA.from(SUPA_TABLE).delete().eq("collection", collection);
+      return !error;
+    }
+    const { error } = await SUPA.from(SUPA_TABLE).upsert({ collection: collection, value: value }, { onConflict: "collection" });
+    return !error;
+  }
+  let _channel = null;
+  function subscribeRealtime() {
+    if (!SUPA || _channel) return;
+    try {
+      _channel = SUPA.channel("hr_store_rt")
+        .on("postgres_changes", { event: "*", schema: "public", table: SUPA_TABLE }, () => {
+          remoteListeners.forEach(fn => { try { fn(); } catch (e) {} }); // 다른 사람이 바꾸면 즉시 알림 → 실시간 공유
+        })
+        .subscribe();
+    } catch (e) {}
+  }
+  // 기존 코드 호환용 어댑터 (남아있는 gasRun 호출을 Supabase 로 연결)
   function gasRun(fn) {
     const args = Array.prototype.slice.call(arguments, 1);
-    const hasGAS = typeof google !== "undefined" && google.script && google.script.run;
-    if (hasGAS) {
-      return new Promise((resolve, reject) => {
-        const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
-        runner[fn].apply(runner, args);
-      });
-    }
-    // 폴백: google.script.run 이 없는 환경(Vercel/정적호스팅/로컬파일) → Apps Script /exec 로 fetch
-    return gasFetch(fn, args);
-  }
-  // JSONP: 크로스도메인(Vercel 등)에서 CORS 없이 읽기 위해 <script> 주입 방식 사용
-  function jsonp(url) {
-    return new Promise((resolve, reject) => {
-      if (typeof document === "undefined") { reject(new Error("no document")); return; }
-      const cb = "__hrjsonp_" + Date.now() + "_" + Math.floor(Math.random() * 1e9);
-      const s = document.createElement("script");
-      let done = false;
-      const cleanup = () => { try { delete window[cb]; } catch (_) { window[cb] = undefined; } if (s.parentNode) s.parentNode.removeChild(s); };
-      window[cb] = (data) => { done = true; resolve(data); cleanup(); };
-      s.onerror = () => { if (!done) { cleanup(); reject(new Error("JSONP 로드 실패 — 저장용 배포 액세스가 '모든 사용자'인지 확인하세요.")); } };
-      s.src = url + (url.indexOf("?") >= 0 ? "&" : "?") + "callback=" + cb + "&t=" + Date.now();
-      (document.head || document.documentElement).appendChild(s);
-      setTimeout(() => { if (!done) { cleanup(); reject(new Error("JSONP 시간초과")); } }, 20000);
-    });
-  }
-  async function gasFetch(fn, args) {
-    if (fn === "getState") {
-      return await jsonp(SHARED_API_URL + "?action=getState"); // JSONP 로 크로스도메인 읽기
-    }
-    if (fn === "listDriveFiles") {
-      const d = await jsonp(SHARED_API_URL + "?action=listFiles&subFolderName=" + encodeURIComponent(args[0] || "default"));
-      return (d && d.files) || (Array.isArray(d) ? d : []);
-    }
-    if (fn === "saveCollection") {
-      // 작은 데이터: JSONP GET 으로 저장(no-cors POST 의 '저장 안 됨' 문제 회피, 응답 확인 가능)
-      // 큰 데이터: URL 길이 제한 때문에 no-cors POST 로 폴백
-      const payload = JSON.stringify(args[1] === undefined ? null : args[1]);
-      const enc = encodeURIComponent(payload);
-      const url = SHARED_API_URL + "?action=save&collection=" + encodeURIComponent(args[0]) + "&value=" + enc;
-      if (url.length < 7000) {
-        try { const r = await jsonp(url); if (r && r.ok) return true; } catch (e) {/* GET 실패 시 POST 폴백 */}
-      }
-      await fetch(SHARED_API_URL, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "replace", collection: args[0], value: args[1] }) });
-      return true;
-    }
-    if (fn === "uploadDriveFile") {
-      // 파일(base64)은 항상 크므로 no-cors POST (URL 로는 못 보냄)
-      const b = args[0] || {};
-      await fetch(SHARED_API_URL, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "uploadFile", fileName: b.fileName, base64Data: b.base64Data, mimeType: b.mimeType, subFolderName: b.subFolderName }) });
-      return { ok: true };
-    }
-    throw new Error("알 수 없는 작업: " + fn);
+    if (fn === "getState") return fetchAll();
+    if (fn === "saveCollection") return upsert(args[0], args[1]);
+    if (fn === "listDriveFiles") return Promise.resolve([]);       // 드라이브 원본보기 기능은 Supabase 전환으로 비활성
+    if (fn === "uploadDriveFile") return Promise.resolve({ ok: false, disabled: true });
+    return Promise.reject(new Error("알 수 없는 작업: " + fn));
   }
   async function boot() {
     emit("loading");
     const mir = readMirror();
     if (mir) applyState(mir); // STORE = 로컬 캐시(내 데이터)로 시작
+    if (!SUPA) { ready = true; emit("error"); return false; } // Supabase 미설정
     try {
-      const data = await gasRun("getState");
+      const state = await fetchAll();
       ready = true;           // ★ applyState 의 자동복구(heal)가 동작하도록 먼저 ready=true
-      applyState(data);       // 서버가 빈 컬렉션은 내 로컬 데이터로 '자동 복구(서버에 재업로드)' → 버튼 불필요
+      applyState(state);      // 서버에 빈 컬렉션은 내 로컬 데이터로 '자동 복구(재업로드)'
       writeMirror();
+      subscribeRealtime();    // 실시간 변경 구독 → 다른 사람 변경이 즉시 반영
       emit("saved");
       return true;
     } catch (e) {
@@ -437,50 +444,24 @@ const SheetDB = function () {
     }
   }
   async function diagnose() {
-    const hasGAS = typeof google !== "undefined" && google.script && google.script.run;
-    const mode = hasGAS ? "google.script.run (Apps Script 호스팅)" : "fetch (외부 호스팅/로컬)";
+    if (!SUPA) {
+      return { ok: false, stage: "env", msg: "Supabase 설정이 비어 있습니다.\nIndex.html 상단의 SUPABASE_URL / SUPABASE_ANON_KEY 를 본인 프로젝트 값으로 채우세요." };
+    }
     try {
-      await gasRun("getState");
+      await fetchAll();
     } catch (e) {
-      return {
-        ok: false,
-        stage: "read",
-        msg: "[전송 방식: " + mode + "]\n서버 읽기에 실패했습니다 (" + (e && e.message || e) + ").\n외부 호스팅(Vercel/로컬)이라면 저장용 Apps Script 배포의 '액세스 권한'이 반드시 '모든 사용자'여야 합니다."
-      };
+      return { ok: false, stage: "read", msg: "Supabase 읽기 실패 (" + (e && e.message || e) + ").\nURL/Key 또는 테이블(hr_store) 및 RLS 정책(select 허용)을 확인하세요." };
     }
     const token = "diag_" + Date.now();
-    try {
-      await gasRun("saveCollection", "__diag__", token);
-    } catch (e) {
-      return {
-        ok: false,
-        stage: "write",
-        msg: "[전송 방식: " + mode + "]\n쓰기(저장)에 실패했습니다 (" + (e && e.message || e) + ")."
-      };
+    const w = await upsert("__diag__", token);
+    if (!w) {
+      return { ok: false, stage: "write", msg: "Supabase 쓰기 실패.\nRLS 정책에서 anon 의 insert/update 가 허용되는지 확인하세요." };
     }
-    let d2;
-    try {
-      d2 = await gasRun("getState");
-    } catch (e) {
-      return {
-        ok: false,
-        stage: "verify",
-        msg: "확인용 읽기 실패: " + (e && e.message || e)
-      };
-    }
-    try {
-      await gasRun("saveCollection", "__diag__", null);
-    } catch (_) {}
-    if (d2 && d2.__diag__ === token) return {
-      ok: true,
-      stage: "ok",
-      msg: "✓ 정상입니다. 읽기와 쓰기(저장) 모두 서버에 반영됩니다.\n[전송 방식: " + mode + "]"
-    };
-    return {
-      ok: false,
-      stage: "write",
-      msg: "저장은 전송됐지만 다시 읽었을 때 값이 확인되지 않았습니다.\nApps Script 코드가 google.script.run 용 함수(getState/saveCollection)를 포함한 최신본인지 확인하세요."
-    };
+    let st;
+    try { st = await fetchAll(); } catch (e) { return { ok: false, stage: "verify", msg: "확인용 읽기 실패: " + (e && e.message || e) }; }
+    await upsert("__diag__", null);
+    if (st && st.__diag__ === token) return { ok: true, stage: "ok", msg: "✓ 정상입니다. Supabase 읽기/쓰기/실시간 동기화가 동작합니다." };
+    return { ok: false, stage: "write", msg: "쓰기가 반영되지 않았습니다. RLS 정책(insert/update/select)을 다시 확인하세요." };
   }
   // 내 로컬(STORE)의 모든 컬렉션을 서버로 강제 업로드 (서버가 비워졌을 때 복구용)
   async function forcePushAll(onProgress) {
@@ -513,6 +494,10 @@ const SheetDB = function () {
       listeners.add(fn);
       fn(status);
       return () => listeners.delete(fn);
+    },
+    onRemote: fn => {
+      remoteListeners.add(fn);
+      return () => remoteListeners.delete(fn);
     },
     get: k => STORE[k],
     getCL: key => STORE.cl[key],
@@ -7717,9 +7702,12 @@ function Dashboard() {
     const onFocus = () => syncFromCloud();
     window.addEventListener("focus", onFocus);
     const iv = setInterval(() => syncFromCloud(), 30000);
+    // Supabase 실시간: 다른 사람이 저장하면 즉시 내 화면에도 반영
+    const offRemote = SheetDB.onRemote ? SheetDB.onRemote(() => syncFromCloud()) : null;
     return () => {
       window.removeEventListener("focus", onFocus);
       clearInterval(iv);
+      if (offRemote) offRemote();
     };
   }, [syncFromCloud]);
   useEffect(() => {
