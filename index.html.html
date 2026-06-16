@@ -177,7 +177,7 @@ const {
   useRef
 } = React;
 const API_URL = "https://script.google.com/macros/s/AKfycbzd8dkOgHBHcsauhB4H2ASU_mdJ9aSAS0IZi66kmwHaXy1QJq3sftoRyPjjxaqZamGjLw/exec";
-const SHARED_API_URL = "https://script.google.com/macros/s/AKfycbxks9MnRA4dhlt7uFyGVWAB9pr8f_NuTuQbRfu6VFcN7Jio2o-P30WVRsVR7e5HhPrP/exec";
+const SHARED_API_URL = "https://script.google.com/macros/s/AKfycbzzX-VzggyDhiApcsQOpCOpclsdZfchHess10ZAAFKEauYEvlrp5XCgixwGzEi__Fv6/exec";
 const LS_KEY = "hr_v15";
 const GTMPL_KEY = "hr_v15_gtmpl";
 const ROUTINE_KEY = "hr_v15_routines";
@@ -334,10 +334,19 @@ const SheetDB = function () {
       return (d && d.files) || (Array.isArray(d) ? d : []);
     }
     if (fn === "saveCollection") {
+      // 작은 데이터: JSONP GET 으로 저장(no-cors POST 의 '저장 안 됨' 문제 회피, 응답 확인 가능)
+      // 큰 데이터: URL 길이 제한 때문에 no-cors POST 로 폴백
+      const payload = JSON.stringify(args[1] === undefined ? null : args[1]);
+      const enc = encodeURIComponent(payload);
+      const url = SHARED_API_URL + "?action=save&collection=" + encodeURIComponent(args[0]) + "&value=" + enc;
+      if (url.length < 7000) {
+        try { const r = await jsonp(url); if (r && r.ok) return true; } catch (e) {/* GET 실패 시 POST 폴백 */}
+      }
       await fetch(SHARED_API_URL, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "replace", collection: args[0], value: args[1] }) });
-      return true; // no-cors: 응답을 읽을 수 없어 낙관적 성공 처리(미러+이후 getState로 확인)
+      return true;
     }
     if (fn === "uploadDriveFile") {
+      // 파일(base64)은 항상 크므로 no-cors POST (URL 로는 못 보냄)
       const b = args[0] || {};
       await fetch(SHARED_API_URL, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "uploadFile", fileName: b.fileName, base64Data: b.base64Data, mimeType: b.mimeType, subFolderName: b.subFolderName }) });
       return { ok: true };
