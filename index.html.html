@@ -177,7 +177,7 @@ const {
   useRef
 } = React;
 const API_URL = "https://script.google.com/macros/s/AKfycbzd8dkOgHBHcsauhB4H2ASU_mdJ9aSAS0IZi66kmwHaXy1QJq3sftoRyPjjxaqZamGjLw/exec";
-const SHARED_API_URL = "https://script.google.com/macros/s/AKfycbyn4BFbo-RaF0w1xUZ1upphJsisTdvVCj9ulRiD1Q_Axj6ruXxKaGcVFzmjgaiLKG9T/exec";
+const SHARED_API_URL = "https://script.google.com/macros/s/AKfycbzf4KVpIUA8scC5a0tmDwaldTSNHrwGHinuVhCjnpTJogVSyiZqkjtPL2tq6f38ej7y/exec";
 const LS_KEY = "hr_v15";
 const GTMPL_KEY = "hr_v15_gtmpl";
 const ROUTINE_KEY = "hr_v15_routines";
@@ -302,16 +302,27 @@ const SheetDB = function () {
     // 폴백: google.script.run 이 없는 환경(Vercel/정적호스팅/로컬파일) → Apps Script /exec 로 fetch
     return gasFetch(fn, args);
   }
+  // JSONP: 크로스도메인(Vercel 등)에서 CORS 없이 읽기 위해 <script> 주입 방식 사용
+  function jsonp(url) {
+    return new Promise((resolve, reject) => {
+      if (typeof document === "undefined") { reject(new Error("no document")); return; }
+      const cb = "__hrjsonp_" + Date.now() + "_" + Math.floor(Math.random() * 1e9);
+      const s = document.createElement("script");
+      let done = false;
+      const cleanup = () => { try { delete window[cb]; } catch (_) { window[cb] = undefined; } if (s.parentNode) s.parentNode.removeChild(s); };
+      window[cb] = (data) => { done = true; resolve(data); cleanup(); };
+      s.onerror = () => { if (!done) { cleanup(); reject(new Error("JSONP 로드 실패 — 저장용 배포 액세스가 '모든 사용자'인지 확인하세요.")); } };
+      s.src = url + (url.indexOf("?") >= 0 ? "&" : "?") + "callback=" + cb + "&t=" + Date.now();
+      (document.head || document.documentElement).appendChild(s);
+      setTimeout(() => { if (!done) { cleanup(); reject(new Error("JSONP 시간초과")); } }, 20000);
+    });
+  }
   async function gasFetch(fn, args) {
     if (fn === "getState") {
-      const r = await fetch(SHARED_API_URL + "?action=getState&t=" + Date.now());
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return await r.json();
+      return await jsonp(SHARED_API_URL + "?action=getState"); // JSONP 로 크로스도메인 읽기
     }
     if (fn === "listDriveFiles") {
-      const r = await fetch(SHARED_API_URL + "?action=listFiles&subFolderName=" + encodeURIComponent(args[0] || "default"));
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const d = await r.json();
+      const d = await jsonp(SHARED_API_URL + "?action=listFiles&subFolderName=" + encodeURIComponent(args[0] || "default"));
       return (d && d.files) || (Array.isArray(d) ? d : []);
     }
     if (fn === "saveCollection") {
