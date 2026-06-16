@@ -347,12 +347,12 @@ const SheetDB = function () {
   async function boot() {
     emit("loading");
     const mir = readMirror();
-    if (mir) applyState(mir);
+    if (mir) applyState(mir); // STORE = 로컬 캐시(내 데이터)로 시작
     try {
       const data = await gasRun("getState");
-      applyState(data);
+      ready = true;           // ★ applyState 의 자동복구(heal)가 동작하도록 먼저 ready=true
+      applyState(data);       // 서버가 빈 컬렉션은 내 로컬 데이터로 '자동 복구(서버에 재업로드)' → 버튼 불필요
       writeMirror();
-      ready = true;
       emit("saved");
       return true;
     } catch (e) {
@@ -473,6 +473,25 @@ const SheetDB = function () {
       msg: "저장은 전송됐지만 다시 읽었을 때 값이 확인되지 않았습니다.\nApps Script 코드가 google.script.run 용 함수(getState/saveCollection)를 포함한 최신본인지 확인하세요."
     };
   }
+  // 내 로컬(STORE)의 모든 컬렉션을 서버로 강제 업로드 (서버가 비워졌을 때 복구용)
+  async function forcePushAll(onProgress) {
+    if (!ready) return { ok: false, msg: "아직 초기화 전입니다. 잠시 후 다시 시도하세요." };
+    const jobs = [];
+    ["team", "employees", "tasks", "ts", "routines", "memos", "gTmpl", "guide", "adminName"].forEach(c => {
+      const v = STORE[c];
+      if (v !== null && v !== undefined) jobs.push([c, v]);
+    });
+    Object.keys(STORE.cl || {}).forEach(k => jobs.push(["cl:" + k, STORE.cl[k]]));
+    Object.keys(STORE.ins || {}).forEach(ym => jobs.push(["ins:" + ym, STORE.ins[ym]]));
+    let done = 0, fail = 0;
+    for (const [c, v] of jobs) {
+      try { await gasRun("saveCollection", c, v); } catch (e) { fail++; }
+      done++;
+      if (onProgress) onProgress(done, jobs.length);
+    }
+    writeMirror();
+    return { ok: fail === 0, total: jobs.length, fail };
+  }
   return {
     boot,
     refresh,
@@ -480,6 +499,7 @@ const SheetDB = function () {
     pushNow,
     diagnose,
     gasRun,
+    forcePushAll,
     onStatus: fn => {
       listeners.add(fn);
       fn(status);
@@ -8124,6 +8144,20 @@ function Dashboard() {
       alert((r.ok ? "[저장 진단: 정상]\n\n" : "[저장 진단: 문제 발견]\n\n") + r.msg);
     }
   }, "\uD83D\uDD0C \uC800\uC7A5 \uC9C4\uB2E8"), React.createElement("button", {
+    className: "btn btn-ghost",
+    style: {
+      fontSize: 11,
+      padding: "5px 12px"
+    },
+    onClick: async () => {
+      if (!confirm("지금 이 화면에 보이는 내 전체 데이터를 서버에 올려 모두에게 공유합니다.\n(서버의 해당 항목을 내 데이터로 덮어씁니다.)\n\n계속할까요?")) return;
+      setToast("내 데이터를 서버에 올리는 중...");
+      const r = await SheetDB.forcePushAll((d, t) => setToast("서버 업로드 " + d + "/" + t + " ..."));
+      setToast(null);
+      if (r.ok) alert("✓ 완료! 내 데이터 " + r.total + "건을 서버에 올렸습니다.\n이제 다른 사람도 새로고침하면 동일하게 보입니다.");
+      else alert("일부 업로드 실패 (" + (r.msg || (r.fail + "/" + r.total + "건 실패")) + ").\n다시 시도해 주세요.");
+    }
+  }, "\u2B06\uFE0F \ub0b4 \ub370\uc774\ud130 \uacf5\uc720"), React.createElement("button", {
     className: "btn btn-ghost",
     style: {
       fontSize: 11,
